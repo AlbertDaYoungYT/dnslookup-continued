@@ -17,8 +17,8 @@ import (
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil/sysresolv"
-	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
+	"github.com/spf13/cobra"
 )
 
 type jsonMsg struct {
@@ -26,67 +26,228 @@ type jsonMsg struct {
 	Elapsed time.Duration `json:"elapsed"`
 }
 
+type Flags struct {
+	MachineReadable    string
+	InsecureSkipVerify string
+	TimeoutStr         string
+	Http3Enabled       string
+	Verbose            string
+	Padding            string
+	Do                 string
+}
+
+type SetFlags struct {
+	MachineReadable    bool
+	InsecureSkipVerify bool
+	Timeout            int
+	Http3Enabled       bool
+	Verbose            bool
+	Padding            bool
+	Do                 bool
+	Subnet             *dns.EDNS0_SUBNET
+	EdnsOpt            *dns.EDNS0_LOCAL
+	Question           dns.Question
+	Server             string
+}
+
 // VersionString -- see the makefile
 var VersionString = "master"
 
-// nolint: gocyclo
 func main() {
-	// parse env variables
-	machineReadable := os.Getenv("JSON") == "1"
-	insecureSkipVerify := os.Getenv("VERIFY") == "0"
-	timeoutStr := os.Getenv("TIMEOUT")
-	http3Enabled := os.Getenv("HTTP3") == "1"
-	verbose := os.Getenv("VERBOSE") == "1"
-	padding := os.Getenv("PAD") == "1"
-	do := os.Getenv("DNSSEC") == "1"
-	subnetOpt := getSubnet()
-	ednsOpt := getEDNSOpt()
+	cmd := rootCommand()
+	if err := cmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
 
-	if verbose {
+func rootCommand() *cobra.Command {
+	flags := Flags{}
+
+	cmd := &cobra.Command{
+		Use:   "gocraftproxy",
+		Short: "A fast and flexible Minecraft Server Proxy",
+		Run: func(cmd *cobra.Command, args []string) {
+			setFlags := getSetFlags(cmd, &flags)
+
+			start(setFlags)
+		},
+	}
+
+	return cmd
+}
+
+func getSetFlags(cmd *cobra.Command, flags *Flags) *SetFlags {
+	machineReadable, err := cmd.Flags().GetBool("machine-readable")
+	if err != nil {
+		log.Fatalf("invalid boolean value for machine-readable: %s", err)
+	}
+
+	insecureSkipVerify, err := cmd.Flags().GetBool("insecure")
+	if err != nil {
+		log.Fatalf("invalid boolean value for insecure: %s", err)
+	}
+
+	timeout, err := cmd.Flags().GetInt("timeout")
+	if err != nil {
+		log.Fatalf("invalid integer value for timeout: %s", err)
+	}
+
+	http3Enabled, err := cmd.Flags().GetBool("http3")
+	if err != nil {
+		log.Fatalf("invalid boolean value for http3: %s", err)
+	}
+
+	verbose, err := cmd.Flags().GetBool("verbose")
+	if err != nil {
+		log.Fatalf("invalid boolean value for verbose: %s", err)
+	}
+
+	padding, err := cmd.Flags().GetBool("padding")
+	if err != nil {
+		log.Fatalf("invalid boolean value for padding: %s", err)
+	}
+
+	do, err := cmd.Flags().GetBool("do")
+	if err != nil {
+		log.Fatalf("invalid boolean value for do: %s", err)
+	}
+
+	subnetStr, err := cmd.Flags().GetString("subnet")
+	if err != nil {
+		log.Fatalf("invalid string value for subnet: %s", err)
+	}
+
+	ednsOptStr, err := cmd.Flags().GetString("edns-opt")
+	if err != nil {
+		log.Fatalf("invalid string value for edns-opt: %s", err)
+	}
+
+	domain, err := cmd.Flags().GetString("domain")
+	if err != nil {
+		log.Fatalf("invalid string value for domain: %s", err)
+	}
+
+	server, err := cmd.Flags().GetString("server")
+	if err != nil {
+		log.Fatalf("invalid string value for server: %s", err)
+	}
+
+	var subnetOpt *dns.EDNS0_SUBNET
+	if subnetStr != "" {
+		_, ipNet, err := net.ParseCIDR(subnetStr)
+		if err != nil {
+			log.Fatalf("invalid SUBNET %s: %v", subnetStr, err)
+		}
+
+		ones, _ := ipNet.Mask.Size()
+
+		subnetOpt = &dns.EDNS0_SUBNET{
+			Code:          dns.EDNS0SUBNET,
+			Family:        1,
+			SourceNetmask: uint8(ones),
+			SourceScope:   0,
+			Address:       ipNet.IP,
+		}
+	}
+
+	var ednsOpt *dns.EDNS0_LOCAL
+	if ednsOptStr != "" {
+		parts := strings.Split(ednsOptStr, ":")
+		code, err := strconv.Atoi(parts[0])
+		if err != nil {
+			log.Fatalf("invalid EDNSOPT %s: %v", ednsOptStr, err)
+		}
+
+		var value []byte
+		if len(parts) > 1 {
+			value, err = hex.DecodeString(parts[1])
+			if err != nil {
+				log.Fatalf("invalid EDNSOPT %s: %v", ednsOptStr, err)
+			}
+		}
+
+		ednsOpt = &dns.EDNS0_LOCAL{
+			Code: uint16(code),
+			Data: value,
+		}
+	}
+
+	rrTypeStr, err := cmd.Flags().GetString("type")
+	if err != nil {
+		log.Fatalf("invalid string value for type: %s", err)
+	}
+
+	classStr, err := cmd.Flags().GetString("class")
+	if err != nil {
+		log.Fatalf("invalid string value for class: %s", err)
+	}
+
+	var rrType uint16
+	var ok bool
+	rrType, ok = dns.StringToType[rrTypeStr]
+	if !ok {
+		if rrTypeStr != "" {
+			log.Fatalf("Invalid RRTYPE: %q", rrTypeStr)
+		}
+
+		rrType = dns.TypeA
+	}
+
+	var qClass uint16
+	qClass, ok = dns.StringToClass[classStr]
+	if!ok {
+		if classStr != "" {
+			log.Fatalf("Invalid CLASS: %q", classStr)
+		}
+
+		qClass = dns.ClassINET
+	}
+
+	// If the user tries to query an IP address and does not specify any
+	// query type, convert to PTR automatically.
+	ip := net.ParseIP(domain)
+	if rrTypeStr == "" && ip != nil {
+		domain = ipToPtr(ip)
+		rrType = dns.TypePTR
+	}
+
+	question := dns.Question{
+		Name:  dns.Fqdn(domain),
+		Qtype: rrType,
+		Qclass: qClass,
+	}
+
+	return &SetFlags{
+		MachineReadable:    machineReadable,
+		InsecureSkipVerify: insecureSkipVerify,
+		Timeout:            timeout,
+		Http3Enabled:       http3Enabled,
+		Verbose:            verbose,
+		Padding:            padding,
+		Do:                 do,
+		Subnet:             subnetOpt,
+		EdnsOpt:            ednsOpt,
+		Question:           question,
+		Server:             server,
+	}
+}
+
+func start(flags *SetFlags) {
+	if flags.Verbose {
 		log.SetLevel(log.DEBUG)
 	}
 
-	timeout := 10
-
-	if !machineReadable {
+	if !flags.MachineReadable {
 		_, _ = os.Stdout.WriteString(fmt.Sprintf("dnslookup %s\n", VersionString))
-
-		if len(os.Args) == 2 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
-			os.Exit(0)
-		}
 	}
 
-	if insecureSkipVerify {
+	if flags.InsecureSkipVerify {
 		_, _ = os.Stdout.WriteString("TLS verification has been disabled\n")
 	}
 
-	if len(os.Args) == 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
-		usage()
-		os.Exit(0)
-	}
-
-	if len(os.Args) < 2 || len(os.Args) > 5 {
-		log.Printf("Wrong number of arguments")
-		usage()
-		os.Exit(1)
-	}
-
-	question := getQuestion()
-
-	if timeoutStr != "" {
-		i, err := strconv.Atoi(timeoutStr)
-		if err != nil {
-			log.Printf("Wrong timeout value: %s", timeoutStr)
-			usage()
-			os.Exit(1)
-		}
-
-		timeout = i
-	}
-
 	var server string
-	if len(os.Args) > 2 {
-		server = os.Args[2]
+	if flags.Server != "" {
+		server = flags.Server
 	} else {
 		sysr, err := sysresolv.NewSystemResolvers(nil, 53)
 		if err != nil {
@@ -98,7 +259,7 @@ func main() {
 	}
 
 	var httpVersions []upstream.HTTPVersion
-	if http3Enabled {
+	if flags.Http3Enabled {
 		httpVersions = []upstream.HTTPVersion{
 			upstream.HTTPVersion3,
 			upstream.HTTPVersion2,
@@ -107,36 +268,9 @@ func main() {
 	}
 
 	opts := &upstream.Options{
-		Timeout:            time.Duration(timeout) * time.Second,
-		InsecureSkipVerify: insecureSkipVerify,
+		Timeout:            time.Duration(flags.Timeout) * time.Second,
+		InsecureSkipVerify: flags.InsecureSkipVerify,
 		HTTPVersions:       httpVersions,
-	}
-
-	if len(os.Args) == 4 {
-		ip := net.ParseIP(os.Args[3])
-		if ip == nil {
-			log.Fatalf("invalid IP specified: %s", os.Args[3])
-		}
-
-		opts.Bootstrap = &singleIPResolver{ip: ip}
-	}
-
-	if len(os.Args) == 5 {
-		// DNSCrypt parameters
-		providerName := os.Args[3]
-		serverPkStr := os.Args[4]
-
-		serverPk, err := hex.DecodeString(strings.ReplaceAll(serverPkStr, ":", ""))
-		if err != nil {
-			log.Fatalf("Invalid server PK %s: %s", serverPkStr, err)
-		}
-
-		var stamp dnsstamps.ServerStamp
-		stamp.Proto = dnsstamps.StampProtoTypeDNSCrypt
-		stamp.ServerAddrStr = server
-		stamp.ProviderName = providerName
-		stamp.ServerPk = serverPk
-		server = stamp.String()
 	}
 
 	u, err := upstream.AddressToUpstream(server, opts)
@@ -147,20 +281,20 @@ func main() {
 	req := &dns.Msg{}
 	req.Id = dns.Id()
 	req.RecursionDesired = true
-	req.Question = []dns.Question{question}
+	req.Question = []dns.Question{flags.Question}
 
-	if subnetOpt != nil {
-		opt := getOrCreateOpt(req, do)
-		opt.Option = append(opt.Option, subnetOpt)
+	if flags.Subnet != nil {
+		opt := getOrCreateOpt(req, flags.Do)
+		opt.Option = append(opt.Option, flags.Subnet)
 	}
 
-	if ednsOpt != nil {
-		opt := getOrCreateOpt(req, do)
-		opt.Option = append(opt.Option, ednsOpt)
+	if flags.EdnsOpt != nil {
+		opt := getOrCreateOpt(req, flags.Do)
+		opt.Option = append(opt.Option, flags.EdnsOpt)
 	}
 
-	if padding {
-		opt := getOrCreateOpt(req, do)
+	if flags.Padding {
+		opt := getOrCreateOpt(req, flags.Do)
 		opt.Option = append(opt.Option, newEDNS0Padding(req))
 	}
 
@@ -170,7 +304,7 @@ func main() {
 		log.Fatalf("Cannot make the DNS request: %s", err)
 	}
 
-	if !machineReadable {
+	if !flags.MachineReadable {
 		msg := fmt.Sprintf("dnslookup result (elapsed %v):\n", time.Now().Sub(startTime))
 		_, _ = os.Stdout.WriteString(fmt.Sprintf("Server: %s\n\n", server))
 		_, _ = os.Stdout.WriteString(msg)
@@ -186,10 +320,32 @@ func main() {
 		var b []byte
 		b, err = json.MarshalIndent(JSONreply, "", "  ")
 		if err != nil {
-			log.Fatalf("Cannot marshal json: %s", err)
+			log.Fatalf("Cannotmarshal json: %s", err)
 		}
 
 		_, _ = os.Stdout.WriteString(string(b) + "\n")
+	}
+}
+
+func init() {
+	cmd := rootCommand()
+	cmd.PersistentFlags().StringP("domain", "d", "", "domain name to lookup")
+	_ = cmd.MarkPersistentFlagRequired("domain")
+	cmd.PersistentFlags().StringP("server", "s", "", "server address. Supported: plain, tcp:// (TCP), tls:// (DOT), https:// (DOH), sdns:// (DNSCrypt), quic:// (DOQ)")
+	cmd.PersistentFlags().String("type", "", "RR type (A, AAAA, PTR, etc.)")
+	cmd.PersistentFlags().String("class", "", "RR class (INET, CH, HS)")
+	cmd.PersistentFlags().String("subnet", "", "EDNS0 client subnet in 'ip/mask' format")
+	cmd.PersistentFlags().String("edns-opt", "", "EDNS0 option in 'code:value' format (value is hex-encoded)")
+	cmd.PersistentFlags().Bool("machine-readable", false, "output in JSON format")
+	cmd.PersistentFlags().Bool("insecure", false, "skip TLS certificate verification")
+	cmd.PersistentFlags().Int("timeout", 10, "timeout in seconds")
+	cmd.PersistentFlags().Bool("http3", false, "enable HTTP/3 (for DoH)")
+	cmd.PersistentFlags().BoolP("verbose", "v", false, "verbose output")
+	cmd.PersistentFlags().Bool("padding", false, "enable EDNS0 padding")
+	cmd.PersistentFlags().Bool("do", false, "set DNSSEC OK bit")
+
+	if err := cmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
 
