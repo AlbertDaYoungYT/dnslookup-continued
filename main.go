@@ -64,8 +64,8 @@ func rootCommand() *cobra.Command {
 	flags := Flags{}
 
 	cmd := &cobra.Command{
-		Use:   "gocraftproxy",
-		Short: "A fast and flexible Minecraft Server Proxy",
+		Use:   "dnslookup",
+		Short: "A command-line tool for DNS lookups",
 		Run: func(cmd *cobra.Command, args []string) {
 			setFlags := getSetFlags(cmd, &flags)
 
